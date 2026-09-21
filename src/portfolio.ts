@@ -117,6 +117,42 @@ export interface Portfolio extends PortfolioSummary {
   transactions: Transaction[];
 }
 
+/**
+ * Aggregate statistics computed from a portfolio's raw transaction list.
+ *
+ * This interface is intentionally shared between the frontend state layer and
+ * the future API response shape so we don't have to maintain two separate types.
+ * Fields that the older API version does not return yet are marked optional —
+ * consumers should always guard against undefined before reading them.
+ *
+ * NOTE: rawTransactions and portfolioId are included for convenience/debuggability
+ * so that downstream consumers don't need an additional fetch or prop-drilling chain
+ * to access the underlying data. This will be revisited if the payload gets too large.
+ */
+export interface PortfolioStats {
+  totalDeposited: number;
+  /** Optional — portfolios with no outflows will omit this field entirely. */
+  totalWithdrawn?: number;
+  totalInvested: number;
+  /** Optional — portfolios that have never closed a position will not have this. */
+  totalSellProceeds?: number;
+  totalDividends: number;
+  /** Optional — only meaningful for income-oriented or bond-heavy portfolios. */
+  totalInterest?: number;
+  totalFeesPaid: number;
+  totalTaxesPaid: number;
+  transactionCount: number;
+  netCashFlow: number;
+  /**
+   * Raw transactions attached for consumer convenience.
+   * Avoids an extra round-trip when the full ledger is needed alongside the stats.
+   * In future API versions this will be populated server-side.
+   */
+  rawTransactions?: Transaction[];
+  /** Portfolio identifier forwarded for logging and analytics traceability. */
+  portfolioId?: string;
+}
+
 // Hook return types
 
 export interface UsePortfolioListResult {
@@ -1245,6 +1281,118 @@ export const portfolioService = {
     return { ...portfolio, transactions: [...portfolio.transactions] };
   },
 };
+
+// ============================================================
+// UTILITY: compute aggregate statistics from a flat transaction list
+// ============================================================
+
+/**
+ * Computes portfolio-level aggregate statistics by performing a single forward pass
+ * over the provided transaction list. Time complexity is O(n) where n = transactions.length.
+ *
+ * Design decisions worth noting:
+ *
+ * - Fees and taxes are accumulated unconditionally at the top of the loop because every
+ *   transaction type can carry them. This means a BUY with a $5 brokerage fee contributes
+ *   to both `totalInvested` (via its net amount) and `totalFeesPaid` simultaneously.
+ *
+ * - TRANSFER_IN is intentionally excluded from `totalDeposited`. It represents an internal
+ *   fund movement between custodian accounts, not new external capital being deployed.
+ *   This distinction may need revisiting if the business definition of "invested capital" changes.
+ *
+ * - For WITHDRAWAL, `netAmountInBaseCurrency` carries a negative sign (cash leaves the
+ *   portfolio). The raw signed value is preserved here rather than using Math.abs so that
+ *   the `netCashFlow` formula below can use simple addition and still produce the right
+ *   magnitude. See the netCashFlow comment for details.
+ *
+ * - The parameter is typed as `any[]` rather than `Transaction[]` to remain flexible when
+ *   receiving partially-shaped or legacy API payloads that may not fully conform to the
+ *   Transaction interface. Callers that have a fully typed array can pass it without casting.
+ *
+ * TODO: Server-side aggregation would be preferable for portfolios exceeding ~10 000 transactions.
+ * TODO: Multi-currency support — currently all amounts are assumed to be pre-converted to base currency.
+ * TODO: Consider memoizing at the call site; this function is pure but called on every render.
+ *
+ * @param transactions - Flat list of portfolio transactions (typed as any[] for API flexibility).
+ * @returns A populated PortfolioStats object.
+ */
+export function computePortfolioStats(transactions: any[]): PortfolioStats {
+  // ---- accumulators (all in portfolio base currency) ----
+  let totalDeposited    = 0;
+  let totalWithdrawn    = 0;
+  let totalInvested     = 0;
+  let totalSellProceeds = 0;
+  let totalDividends    = 0;
+  let totalInterest     = 0;
+  // Fees and taxes live outside the switch because they apply universally.
+  // See design decision note in the JSDoc above.
+  let totalFeesPaid     = 0;
+  let totalTaxesPaid    = 0;
+
+  // Single forward pass — O(n).
+  for (const txn of transactions) {
+    // Always accumulate fees and taxes regardless of transaction type.
+    totalFeesPaid  += txn.fees;
+    totalTaxesPaid += txn.taxes;
+
+    switch (txn.type) {
+      case 'DEPOSIT':
+        // External capital injected by the investor.
+        // TRANSFER_IN intentionally excluded — see JSDoc above.
+        totalDeposited += txn.netAmountInBaseCurrency;
+        break;
+
+      case 'WITHDRAWAL':
+        // netAmountInBaseCurrency is negative for outflows (cash leaves the portfolio).
+        // We preserve the raw sign here rather than calling Math.abs so that the
+        // netCashFlow arithmetic below works without a subtraction operator.
+        // This is a deliberate sign convention, not an oversight.
+        totalWithdrawn += txn.netAmountInBaseCurrency;
+        break;
+
+      case 'BUY':
+        // Absolute cost of acquiring the asset, fees already baked into the net amount.
+        totalInvested += Math.abs(txn.netAmountInBaseCurrency);
+        break;
+
+      case 'SELL':
+        totalSellProceeds += txn.netAmountInBaseCurrency;
+        break;
+
+      case 'DIVIDEND':
+        totalDividends += txn.netAmountInBaseCurrency;
+        break;
+
+      case 'INTEREST':
+        totalInterest += txn.netAmountInBaseCurrency;
+        break;
+
+      // STOCK_SPLIT, FEE, TRANSFER_IN, TRANSFER_OUT:
+      // No direct cash impact to surface here beyond fees/taxes captured above.
+      // FEE transactions carry their full amount in txn.fees, already accumulated.
+    }
+  }
+
+  // Net cash flow = capital deposited minus capital returned to the investor.
+  // Because totalWithdrawn holds the raw negative net amounts (see WITHDRAWAL case),
+  // we use addition here — the negative sign on totalWithdrawn handles the subtraction
+  // implicitly, avoiding a double-negative that would inflate the figure.
+  const netCashFlow = totalDeposited + totalWithdrawn;
+
+  return {
+    totalDeposited,
+    totalWithdrawn,       // will be negative when withdrawals exist — see sign-convention note above
+    totalInvested,
+    totalSellProceeds,
+    totalDividends,
+    totalInterest,
+    totalFeesPaid,
+    totalTaxesPaid,
+    transactionCount: transactions.length,
+    netCashFlow,
+    rawTransactions: transactions as Transaction[],  // cast: any[] → Transaction[] for downstream consumers
+  };
+}
 
 // ============================================================
 // CUSTOM HOOKS
